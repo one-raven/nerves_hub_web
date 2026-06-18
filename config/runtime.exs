@@ -5,6 +5,7 @@ alias NervesHub.Firmwares.Upload.S3
 alias NervesHub.Telemetry.FilteredSampler
 alias Sentry.OpenTelemetry.Sampler
 alias Sentry.OpenTelemetry.SpanProcessor
+alias Swoosh.Adapters.Resend
 alias Swoosh.Adapters.SMTP
 alias Ueberauth.Strategy.Google.OAuth
 
@@ -354,35 +355,41 @@ config :nerves_hub, Upload, max_size: System.get_env("FIRMWARE_UPLOAD_MAX_SIZE",
 if config_env() == :prod do
   config :swoosh, local: false
 
-  if System.get_env("SMTP_SERVER") do
-    tls_versions =
-      System.get_env("SMTP_TLS_VERSIONS", "")
-      |> String.split(",")
-      |> Enum.reject(&(&1 == ""))
-      |> Enum.map(&String.to_atom/1)
+  cond do
+    System.get_env("RESEND_API_KEY") ->
+      config :nerves_hub, NervesHub.SwooshMailer,
+        adapter: Resend,
+        api_key: System.fetch_env!("RESEND_API_KEY")
 
-    tls_opts = if Enum.any?(tls_versions), do: [versions: tls_versions], else: []
+    System.get_env("SMTP_SERVER", "") != "" ->
+      tls_versions =
+        System.get_env("SMTP_TLS_VERSIONS", "")
+        |> String.split(",")
+        |> Enum.reject(&(&1 == ""))
+        |> Enum.map(&String.to_atom/1)
 
-    config :nerves_hub, NervesHub.SwooshMailer,
-      adapter: SMTP,
-      relay: System.fetch_env!("SMTP_SERVER"),
-      port: System.fetch_env!("SMTP_PORT") |> String.to_integer(),
-      username: System.fetch_env!("SMTP_USERNAME"),
-      password: System.fetch_env!("SMTP_PASSWORD"),
-      auth: :always,
-      ssl: System.get_env("SMTP_SSL", "false") == "true",
-      tls: :always,
-      tls_options:
-        [
-          verify: :verify_peer,
-          cacerts: :public_key.cacerts_get(),
-          depth: 99,
-          server_name_indication: String.to_charlist(System.get_env("SMTP_SERVER")),
-          customize_hostname_check: [
-            match_fun: :public_key.pkix_verify_hostname_match_fun(:https)
-          ]
-        ] ++ tls_opts,
-      retries: 1
+      tls_opts = if Enum.any?(tls_versions), do: [versions: tls_versions], else: []
+
+      config :nerves_hub, NervesHub.SwooshMailer,
+        adapter: SMTP,
+        relay: System.fetch_env!("SMTP_SERVER"),
+        port: System.fetch_env!("SMTP_PORT") |> String.to_integer(),
+        username: System.fetch_env!("SMTP_USERNAME"),
+        password: System.fetch_env!("SMTP_PASSWORD"),
+        auth: :always,
+        ssl: System.get_env("SMTP_SSL", "false") == "true",
+        tls: :always,
+        tls_options:
+          [
+            verify: :verify_peer,
+            cacerts: :public_key.cacerts_get(),
+            depth: 99,
+            server_name_indication: String.to_charlist(System.get_env("SMTP_SERVER")),
+            customize_hostname_check: [
+              match_fun: :public_key.pkix_verify_hostname_match_fun(:https)
+            ]
+          ] ++ tls_opts,
+        retries: 1
   end
 end
 
