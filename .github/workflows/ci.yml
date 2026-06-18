@@ -175,7 +175,7 @@ jobs:
         env:
           DOCKER_METADATA_PR_HEAD_SHA: true
         with:
-          images: ghcr.io/nerves-hub/nerves-hub
+          images: ghcr.io/one-raven/nerves-hub
           tags: |
             # short sha
             type=sha,prefix=,suffix=,format=short
