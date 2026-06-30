@@ -133,88 +133,103 @@ if config_env() == :prod do
         For example: device.mynerveshub.com
         """
 
-    https_port = String.to_integer(System.get_env("DEVICE_PORT", "443"))
+    device_port = String.to_integer(System.get_env("DEVICE_PORT", "443"))
 
-    keyfile =
-      if System.get_env("DEVICE_SSL_KEY") do
-        ssl_key = System.fetch_env!("DEVICE_SSL_KEY") |> Base.decode64!()
-        File.mkdir_p!("/app/tmp")
-        File.write!("/app/tmp/ssl_key.crt", ssl_key)
-        "/app/tmp/ssl_key.crt"
-      else
-        ssl_keyfile = System.get_env("DEVICE_SSL_KEYFILE", "/etc/ssl/#{host}-key.pem")
-
-        if File.exists?(ssl_keyfile) do
-          ssl_keyfile
+    if System.get_env("DEVICE_TLS_TERMINATED_AT_PROXY", "false") == "true" do
+      # A load balancer in front of NervesHub terminates TLS (and mTLS) and
+      # forwards the verified client certificate to us in a request header
+      # (read by NervesHubWeb.DeviceSocket). The device endpoint therefore
+      # serves plain HTTP on the private network.
+      #
+      # SECURITY: the proxy -> backend path MUST be locked down (firewall /
+      # network policy) so that only the load balancer can reach this port.
+      # Otherwise the forwarded client-cert header could be spoofed by anyone
+      # able to connect directly.
+      config :nerves_hub, NervesHubWeb.DeviceEndpoint,
+        url: [host: host, scheme: "https", port: 443],
+        http: [port: device_port]
+    else
+      keyfile =
+        if System.get_env("DEVICE_SSL_KEY") do
+          ssl_key = System.fetch_env!("DEVICE_SSL_KEY") |> Base.decode64!()
+          File.mkdir_p!("/app/tmp")
+          File.write!("/app/tmp/ssl_key.crt", ssl_key)
+          "/app/tmp/ssl_key.crt"
         else
-          raise "Could not find keyfile"
+          ssl_keyfile = System.get_env("DEVICE_SSL_KEYFILE", "/etc/ssl/#{host}-key.pem")
+
+          if File.exists?(ssl_keyfile) do
+            ssl_keyfile
+          else
+            raise "Could not find keyfile"
+          end
         end
-      end
 
-    certfile =
-      if encoded_cert = System.get_env("DEVICE_SSL_CERT") do
-        ssl_cert = Base.decode64!(encoded_cert)
-        File.mkdir_p!("/app/tmp")
-        File.write!("/app/tmp/ssl_cert.crt", ssl_cert)
-        "/app/tmp/ssl_cert.crt"
-      else
-        ssl_certfile = System.get_env("DEVICE_SSL_CERTFILE", "/etc/ssl/#{host}.pem")
-
-        if File.exists?(ssl_certfile) do
-          ssl_certfile
+      certfile =
+        if encoded_cert = System.get_env("DEVICE_SSL_CERT") do
+          ssl_cert = Base.decode64!(encoded_cert)
+          File.mkdir_p!("/app/tmp")
+          File.write!("/app/tmp/ssl_cert.crt", ssl_cert)
+          "/app/tmp/ssl_cert.crt"
         else
-          raise "Could not find certfile"
-        end
-      end
+          ssl_certfile = System.get_env("DEVICE_SSL_CERTFILE", "/etc/ssl/#{host}.pem")
 
-    cacertfile =
-      if cacertfile = System.get_env("DEVICE_SSL_CACERTFILE") do
-        if File.exists?(cacertfile) do
-          cacertfile
+          if File.exists?(ssl_certfile) do
+            ssl_certfile
+          else
+            raise "Could not find certfile"
+          end
+        end
+
+      cacertfile =
+        if cacertfile = System.get_env("DEVICE_SSL_CACERTFILE") do
+          if File.exists?(cacertfile) do
+            cacertfile
+          else
+            raise "Could not find certfile"
+          end
         else
-          raise "Could not find certfile"
+          CAStore.file_path()
         end
-      else
-        CAStore.file_path()
-      end
 
-    transport_options = [
-      verify: :verify_peer,
-      verify_fun: {&NervesHub.SSL.verify_fun/3, nil},
-      fail_if_no_peer_cert: false,
-      keyfile: keyfile,
-      certfile: certfile,
-      cacertfile: cacertfile,
-      hibernate_after: 15_000
-    ]
-
-    # Older versions of OTP 25 may break using using devices
-    # that support TLS 1.3 or 1.2 negotiation. To mitigate that
-    # potential error, by default we enforce TLS 1.2.
-    # If you're using OTP >= 25.1 on all devices, then it is safe to
-    # allow TLS 1.3 and setting `certificate_authorities: false` since we
-    # don't expect devices to send full chains to the server
-    # See https://github.com/erlang/otp/issues/6492#issuecomment-1323874205
-    transport_options =
-      if System.get_env("DEVICE_ENABLE_TLS_13", "false") == "true" do
-        transport_options ++ [certificate_authorities: false]
-      else
-        transport_options ++ [versions: [:"tlsv1.2"]]
-      end
-
-    config :nerves_hub, NervesHubWeb.DeviceEndpoint,
-      url: [host: host],
-      https: [
-        port: https_port,
-        otp_app: :nerves_hub,
-        http_options: [
-          log_protocol_errors: false
-        ],
-        thousand_island_options: [
-          transport_module: NervesHub.DeviceSSLTransport,
-          transport_options: transport_options
-        ]
+      transport_options = [
+        verify: :verify_peer,
+        verify_fun: {&NervesHub.SSL.verify_fun/3, nil},
+        fail_if_no_peer_cert: false,
+        keyfile: keyfile,
+        certfile: certfile,
+        cacertfile: cacertfile,
+        hibernate_after: 15_000
       ]
+
+      # Older versions of OTP 25 may break using using devices
+      # that support TLS 1.3 or 1.2 negotiation. To mitigate that
+      # potential error, by default we enforce TLS 1.2.
+      # If you're using OTP >= 25.1 on all devices, then it is safe to
+      # allow TLS 1.3 and setting `certificate_authorities: false` since we
+      # don't expect devices to send full chains to the server
+      # See https://github.com/erlang/otp/issues/6492#issuecomment-1323874205
+      transport_options =
+        if System.get_env("DEVICE_ENABLE_TLS_13", "false") == "true" do
+          transport_options ++ [certificate_authorities: false]
+        else
+          transport_options ++ [versions: [:"tlsv1.2"]]
+        end
+
+      config :nerves_hub, NervesHubWeb.DeviceEndpoint,
+        url: [host: host],
+        https: [
+          port: device_port,
+          otp_app: :nerves_hub,
+          http_options: [
+            log_protocol_errors: false
+          ],
+          thousand_island_options: [
+            transport_module: NervesHub.DeviceSSLTransport,
+            transport_options: transport_options
+          ]
+        ]
+    end
   end
 
   if nerves_hub_app == "device" do
@@ -229,6 +244,10 @@ if config_env() == :prod do
   end
 
   config :nerves_hub, NervesHubWeb.DeviceSocket,
+    # Header carrying the load-balancer-forwarded client certificate (RFC 9440,
+    # base64 DER wrapped in colons). Only trusted when the device endpoint runs
+    # behind a TLS-terminating proxy; see DEVICE_TLS_TERMINATED_AT_PROXY.
+    client_cert_header: System.get_env("DEVICE_CLIENT_CERT_HEADER", "x-client-cert"),
     shared_secrets: [
       enabled: System.get_env("DEVICE_SHARED_SECRETS_ENABLED", "false") == "true"
     ]

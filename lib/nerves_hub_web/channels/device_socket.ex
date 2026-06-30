@@ -94,13 +94,46 @@ defmodule NervesHubWeb.DeviceSocket do
     assign(socket, :last_heartbeat, System.monotonic_time(:second))
   end
 
-  # Used by Devices connecting with SSL certificates
+  # Used by Devices terminating TLS directly against this endpoint.
   @impl Phoenix.Socket
   @decorate with_span("Channels.DeviceSocket.connect:cert_auth")
   def connect(_params, socket, %{peer_data: %{ssl_cert: ssl_cert}}) when not is_nil(ssl_cert) do
-    X509.Certificate.from_der!(ssl_cert)
-    |> Devices.get_device_by_x509()
-    |> case do
+    ssl_cert
+    |> X509.Certificate.from_der!()
+    |> authenticate_by_cert(socket)
+  end
+
+  # Used by Devices connecting through a TLS-terminating load balancer that
+  # forwards the verified client certificate (and/or HMAC shared-secret
+  # headers) to the backend as request headers. A forwarded certificate takes
+  # precedence; absent one we fall back to HMAC shared-secret auth.
+  @decorate with_span("Channels.DeviceSocket.connect:headers")
+  def connect(_params, socket, %{x_headers: x_headers}) when is_list(x_headers) and x_headers != [] do
+    headers = Map.new(x_headers)
+
+    case forwarded_client_cert(headers) do
+      {:ok, cert} ->
+        authenticate_by_cert(cert, socket)
+
+      {:error, reason} ->
+        :telemetry.execute([:nerves_hub, :devices, :invalid_auth], %{count: 1}, %{
+          auth: :cert_header,
+          reason: reason
+        })
+
+        {:error, :invalid_auth}
+
+      :no_cert ->
+        connect_via_shared_secret(socket, headers)
+    end
+  end
+
+  def connect(_params, _socket, _connect_info) do
+    {:error, :no_auth}
+  end
+
+  defp authenticate_by_cert(cert, socket) do
+    case Devices.get_device_by_x509(cert) do
       {:ok, device} ->
         socket_and_assigns(socket, device)
 
@@ -114,12 +147,65 @@ defmodule NervesHubWeb.DeviceSocket do
     end
   end
 
-  # Used by Devices connecting with HMAC Shared Secrets
-  @decorate with_span("Channels.DeviceSocket.connect:shared_secrets")
-  def connect(_params, socket, %{x_headers: x_headers})
-      when is_list(x_headers) and (is_list(x_headers) and x_headers != []) do
-    headers = Map.new(x_headers)
+  # A TLS-terminating load balancer forwards the leaf certificate in a header.
+  # GCP uses RFC 9440 (base64-encoded DER wrapped in colons); some proxies emit
+  # (URL-encoded) PEM instead, so we accept either. Returns `:no_cert` when the
+  # header is absent so the caller can fall back to shared-secret auth, or
+  # `{:error, reason}` when a cert is present but unparseable.
+  defp forwarded_client_cert(headers) do
+    case Map.get(headers, client_cert_header()) do
+      value when value in [nil, ""] ->
+        :no_cert
 
+      value ->
+        parse_forwarded_cert(String.trim(value))
+    end
+  end
+
+  defp parse_forwarded_cert(value) do
+    decoded = URI.decode(value)
+
+    cond do
+      pem_cert?(value) -> cert_from_pem(value)
+      pem_cert?(decoded) -> cert_from_pem(decoded)
+      true -> value |> String.trim(":") |> cert_from_base64_der()
+    end
+  end
+
+  defp pem_cert?(value), do: String.contains?(value, "BEGIN CERTIFICATE")
+
+  defp cert_from_pem(pem) do
+    case X509.Certificate.from_pem(pem) do
+      {:ok, cert} -> {:ok, cert}
+      _ -> {:error, :malformed_client_cert}
+    end
+  end
+
+  defp cert_from_base64_der(b64) do
+    case decode_base64(b64) do
+      {:ok, der} -> der_to_x509(der)
+      :error -> {:error, :malformed_client_cert_header}
+    end
+  end
+
+  defp decode_base64(b64) do
+    with :error <- Base.decode64(b64, ignore: :whitespace) do
+      Base.url_decode64(b64, ignore: :whitespace, padding: false)
+    end
+  end
+
+  defp der_to_x509(der) do
+    {:ok, X509.Certificate.from_der!(der)}
+  rescue
+    _ -> {:error, :malformed_client_cert}
+  end
+
+  defp client_cert_header() do
+    Application.get_env(:nerves_hub, __MODULE__, [])
+    |> Keyword.get(:client_cert_header, "x-client-cert")
+  end
+
+  defp connect_via_shared_secret(socket, headers) do
     with :ok <- check_shared_secret_enabled(),
          {:ok, key, salt, verification_opts} <- decode_from_headers(headers),
          {:ok, auth} <- get_shared_secret_auth(key),
@@ -172,8 +258,6 @@ defmodule NervesHubWeb.DeviceSocket do
     end
   rescue
     e in ArgumentError ->
-      headers = Map.new(x_headers)
-
       :telemetry.execute([:nerves_hub, :devices, :invalid_auth], %{count: 1}, %{
         auth: :shared_secrets,
         reason: e,
@@ -181,10 +265,6 @@ defmodule NervesHubWeb.DeviceSocket do
       })
 
       {:error, :invalid_auth}
-  end
-
-  def connect(_params, _socket, _connect_info) do
-    {:error, :no_auth}
   end
 
   @impl Phoenix.Socket

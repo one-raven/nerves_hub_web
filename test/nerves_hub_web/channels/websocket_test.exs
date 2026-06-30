@@ -309,6 +309,73 @@ defmodule NervesHubWeb.WebsocketTest do
     end
   end
 
+  describe "client certificate forwarded by a TLS-terminating proxy" do
+    @describetag :tmp_dir
+
+    test "authenticates a device from the x-client-cert header", %{user: user, tmp_dir: tmp_dir} do
+      {device, _firmware} = device_fixture(tmp_dir, user, %{identifier: @valid_serial})
+
+      %{cert: cert} = Fixtures.device_certificate_fixture(device)
+
+      opts = [
+        mint_opts: [protocols: [:http1]],
+        uri: "ws://127.0.0.1:#{@web_port}/device-socket/websocket",
+        headers: [{"x-client-cert", rfc9440_header(cert)}]
+      ]
+
+      subscribe_for_updates(device)
+
+      {:ok, socket} = SocketClient.start_link(opts)
+      SocketClient.join_and_wait(socket)
+
+      assert_online_and_available(device)
+
+      close_socket_cleanly(socket)
+    end
+
+    test "rejects an unknown certificate in the x-client-cert header", %{user: user, tmp_dir: tmp_dir} do
+      {device, _firmware} = device_fixture(tmp_dir, user, %{identifier: @valid_serial})
+
+      # A well-formed cert that was never registered for this device.
+      ca_key = X509.PrivateKey.new_ec(:secp256r1)
+      ca = X509.Certificate.self_signed(ca_key, "CN=unknown-signer", template: :root_ca)
+
+      cert =
+        X509.PrivateKey.new_ec(:secp256r1)
+        |> X509.PublicKey.derive()
+        |> X509.Certificate.new("CN=#{device.identifier}", ca, ca_key)
+
+      opts = [
+        mint_opts: [protocols: [:http1]],
+        uri: "ws://127.0.0.1:#{@web_port}/device-socket/websocket",
+        headers: [{"x-client-cert", rfc9440_header(cert)}]
+      ]
+
+      {:ok, socket} = SocketClient.start_link(opts)
+      SocketClient.wait_connect(socket)
+
+      refute SocketClient.connected?(socket)
+      refute_online(device)
+    end
+
+    test "rejects a malformed x-client-cert header", %{user: user, tmp_dir: tmp_dir} do
+      {device, _firmware} = device_fixture(tmp_dir, user, %{identifier: @valid_serial})
+      _ = Fixtures.device_certificate_fixture(device)
+
+      opts = [
+        mint_opts: [protocols: [:http1]],
+        uri: "ws://127.0.0.1:#{@web_port}/device-socket/websocket",
+        headers: [{"x-client-cert", ":not-a-certificate:"}]
+      ]
+
+      {:ok, socket} = SocketClient.start_link(opts)
+      SocketClient.wait_connect(socket)
+
+      refute SocketClient.connected?(socket)
+      refute_online(device)
+    end
+  end
+
   describe "shared secret auth NH1" do
     @describetag :tmp_dir
 
@@ -1408,5 +1475,11 @@ defmodule NervesHubWeb.WebsocketTest do
     SocketClient.clean_close(socket)
     eventually assert_connection_change()
     eventually(assert(Repo.all(where(DeviceConnection, status: :connected)) == []))
+  end
+
+  # Mirrors how a TLS-terminating load balancer forwards the leaf certificate:
+  # the DER-encoded cert, base64-encoded and wrapped in colons (RFC 9440).
+  defp rfc9440_header(cert) do
+    ":" <> Base.encode64(X509.Certificate.to_der(cert)) <> ":"
   end
 end
